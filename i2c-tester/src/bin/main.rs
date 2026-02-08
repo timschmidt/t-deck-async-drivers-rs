@@ -36,7 +36,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 ///
 /// This function initializes the necessary hardware, including the I2C bus,
 /// and then enters an infinite loop to scan for I2C devices.
-#[esp_hal_embassy::main]
+#[esp_rtos::main]
 async fn main(spawner: Spawner) {
     // generator version: 0.5.0
     esp_println::logger::init_logger(log::LevelFilter::Debug);
@@ -46,7 +46,7 @@ async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
     let timer0 = SystemTimer::new(peripherals.SYSTIMER);
-    esp_hal_embassy::init(timer0.alarm0);
+    esp_rtos::start(timer0.alarm0);
 
     let i2c_scl = peripherals.GPIO14;
     let i2c_sda = peripherals.GPIO13;

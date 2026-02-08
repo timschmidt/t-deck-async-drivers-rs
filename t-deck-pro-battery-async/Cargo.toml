@@ -1,8 +1,8 @@
 [package]
 name = "t-deck-pro-battery-async"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.86"
+edition = "2024"
+rust-version = "1.88"
 
 [[example]]
 name = "simple_battery"
@@ -24,7 +24,7 @@ embedded-io = {workspace = true}
 embedded-io-async = {workspace = true}
 esp-alloc = {workspace = true}
 esp-bootloader-esp-idf = {workspace = true}
-esp-hal-embassy = {workspace = true}
+esp-rtos = {workspace = true}
 esp-println = {workspace = true}
 smoltcp = {workspace = true}
 static_cell = {workspace = true}
