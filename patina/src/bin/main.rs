@@ -15,9 +15,9 @@ use core::fmt::Write;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
+use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_sync::rwlock::RwLock;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{with_timeout, Delay, Duration, Instant, Timer};
 
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
@@ -46,10 +46,63 @@ use embedded_graphics::{
     text::Text,
 };
 
-// Shared battery text for the display
+// Shared battery text type
 type BatteryText = heapless::String<192>;
-static BATTERY_TEXT: Mutex<CriticalSectionRawMutex, BatteryText> =
-    Mutex::new(heapless::String::new());
+
+/// App -> Display commands
+#[derive(Clone)]
+enum DisplayCmd {
+    Render(AppModel),
+}
+
+/// Events produced by peripheral tasks
+#[derive(Clone)]
+enum AppEvent {
+    Battery(BatteryText),
+    Key(heapless::String<64>),
+    Touch(heapless::String<64>),
+    Network(heapless::String<64>),
+}
+
+/// Central app model (what the UI renders)
+#[derive(Clone)]
+struct AppModel {
+    battery: BatteryText,
+    last_key: heapless::String<64>,
+    last_touch: heapless::String<64>,
+    net: heapless::String<64>,
+    counter: u32,
+}
+
+impl Default for AppModel {
+    fn default() -> Self {
+        let mut battery = BatteryText::new();
+        let _ = write!(battery, "Battery:\n(no data)");
+        Self {
+            battery,
+            last_key: heapless::String::new(),
+            last_touch: heapless::String::new(),
+            net: heapless::String::new(),
+            counter: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingKind {
+    Immediate,
+    Coalesced,
+    Debounced,
+}
+
+#[derive(Clone, Copy)]
+struct PendingRefresh {
+    at: Instant,
+    kind: PendingKind,
+}
+
+static EVENT_CH: Channel<CriticalSectionRawMutex, AppEvent, 32> = Channel::new();
+static DISPLAY_CH: Channel<CriticalSectionRawMutex, DisplayCmd, 4> = Channel::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see:
@@ -162,17 +215,35 @@ async fn main(spawner: Spawner) -> ! {
     // ---------------------------------------------------------------------
     // Spawn tasks
     // ---------------------------------------------------------------------
+    let ev_tx = EVENT_CH.sender();
+    let ev_rx = EVENT_CH.receiver();
+
+    let disp_tx = DISPLAY_CH.sender();
+    let disp_rx = DISPLAY_CH.receiver();
+
     spawner
-        .spawn(battery_task(battery_service, &BATTERY_TEXT))
+        .spawn(battery_task(battery_service, ev_tx.clone()))
         .expect("spawn battery_task failed");
     spawner
-        .spawn(keyboard_task(keyboard_controller))
+        .spawn(keyboard_task(keyboard_controller, ev_tx.clone()))
         .expect("spawn keyboard_task failed");
     spawner
-        .spawn(touch_task(touch_controller))
+        .spawn(touch_task(touch_controller, ev_tx.clone()))
         .expect("spawn touch_task failed");
+
+    // Optional placeholder network producer (replace with real networking)
     spawner
-        .spawn(epd_task(display, spi_device, &BATTERY_TEXT))
+        .spawn(network_task(ev_tx.clone()))
+        .expect("spawn network_task failed");
+
+    // Central coordinator that decides refresh timing
+    spawner
+        .spawn(app_task(ev_rx, disp_tx))
+        .expect("spawn app_task failed");
+
+    // EPD is now a pure renderer/driver: refresh only on commands
+    spawner
+        .spawn(epd_task(display, spi_device, disp_rx))
         .expect("spawn epd_task failed");
 
     info!("All tasks spawned; entering idle loop");
@@ -187,27 +258,15 @@ async fn battery_task(
         RwLockI2cDevice<I2c<'static, esp_hal::Async>, esp_hal::i2c::master::Error>,
         esp_hal::i2c::master::Error,
     >,
-    battery_text: &'static Mutex<CriticalSectionRawMutex, BatteryText>,
+    ev_tx: Sender<'static, CriticalSectionRawMutex, AppEvent, 32>,
 ) {
+    let mut last_sent = BatteryText::new();
+
     loop {
+        let mut s = BatteryText::new();
+
         match battery.measure().await {
             Ok(data) => {
-                info!("--- Battery Status ---");
-                info!("Voltage: {=f32} V", data.voltage);
-                info!("VBUS Voltage: {=f32} V", data.vbus_voltage);
-                info!("Charge Current: {=f32} A", data.charge_current);
-                info!("Battery Temp Percent: {=f32}%", data.battery_temp_percent);
-                info!("Charge Status: {:?}", data.charging_status);
-                info!("VBUS Status: {:?}", data.vbus_status);
-                info!("Power Good: {}", data.power_good);
-                info!("Faults: {:?}", data.faults);
-                info!("----------------------");
-                
-                // Format a concise multi-line summary for the EPD.
-                let mut s = BatteryText::new();
-
-                // Keep it short enough to fit comfortably on screen.
-                // (You can tweak wording / add more fields if you like.)
                 let _ = write!(
                     s,
                     "Battery:\n\
@@ -222,26 +281,24 @@ async fn battery_task(
                     chg = data.charging_status,
                     pg = data.power_good,
                 );
-
-                // Publish to shared state
-                let mut guard = battery_text.lock().await;
-                *guard = s;
             }
             Err(_) => {
-				warn!("Battery: measure() failed");
-				
-				// Still publish something so the display shows a sane state.
-                let mut guard = battery_text.lock().await;
-                guard.clear();
-                let _ = write!(*guard, "Battery:\n(read error)");
-			}
+                warn!("Battery: measure() failed");
+                let _ = write!(s, "Battery:\n(read error)");
+            }
+        }
+
+        // Only send if what would be displayed changed
+        if s != last_sent {
+            last_sent = s.clone();
+            ev_tx.send(AppEvent::Battery(s)).await;
         }
 
         if battery.disable_adc().await.is_err() {
             warn!("Battery: disable_adc() failed");
         }
 
-        Timer::after(Duration::from_secs(5)).await;
+        Timer::after(Duration::from_secs(30)).await;
     }
 }
 
@@ -252,21 +309,23 @@ async fn keyboard_task(
         RwLockI2cDevice<I2c<'static, esp_hal::Async>, esp_hal::i2c::master::Error>,
         esp_hal::i2c::master::Error,
     >,
+    ev_tx: Sender<'static, CriticalSectionRawMutex, AppEvent, 32>,
 ) {
     loop {
         match keyboard.read_key_events().await {
             Ok(events) => {
                 for ev in events {
-                    // Your gps example treated KeyState::Up as "pressed/released" boundary.
+                    // Treat KeyState::Up as the "action" boundary (matches your prior behavior).
                     if ev.state == KeyState::Up {
                         info!("Key: {:?} (up)", ev.key);
-                    } else {
-                        info!("Key: {:?} (down)", ev.key);
+
+                        let mut s = heapless::String::<64>::new();
+                        let _ = write!(s, "{:?}", ev.key);
+                        ev_tx.send(AppEvent::Key(s)).await;
                     }
                 }
             }
             Err(_) => {
-                // If this gets chatty, reduce to warn! occasionally.
                 warn!("Keyboard: read_key_events() error");
                 Timer::after(Duration::from_millis(50)).await;
             }
@@ -281,20 +340,203 @@ async fn touch_task(
         RwLockI2cDevice<I2c<'static, esp_hal::Async>, esp_hal::i2c::master::Error>,
         esp_hal::i2c::master::Error,
     >,
+    ev_tx: Sender<'static, CriticalSectionRawMutex, AppEvent, 32>,
 ) {
+    let mut last_sent = heapless::String::<64>::new(); // "" means "none"
+
     loop {
         match touch.read_touches().await {
             Ok(touches) => {
+                // Represent "no touch" as empty string, so UI prints "(none)"
+                let mut s = heapless::String::<64>::new();
                 if !touches.is_empty() {
-                    info!("Touch: {:?}", touches);
+                    let _ = write!(s, "{:?}", touches);
+                }
+
+                // Only send if the displayed representation changed
+                if s != last_sent {
+                    last_sent = s.clone();
+                    ev_tx.send(AppEvent::Touch(s)).await;
                 }
             }
             Err(_) => {
-                // Touch can be noisy on startup; keep it as warn.
                 warn!("Touch: read_touches() error");
             }
         }
-        Timer::after(Duration::from_millis(20)).await;
+
+        // You can likely increase this now; 20ms is very aggressive for EPD-driven UI.
+        Timer::after(Duration::from_millis(30)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn network_task(
+    ev_tx: Sender<'static, CriticalSectionRawMutex, AppEvent, 32>,
+) {
+    // Placeholder producer:
+    // Replace with your actual WiFi/LwIP/etc task that emits Network(...) events.
+    // Keeping it very quiet by default.
+    let mut last = heapless::String::<64>::new();
+    let _ = write!(last, "net: (not started)");
+    ev_tx.send(AppEvent::Network(last)).await;
+
+    loop {
+        Timer::after(Duration::from_secs(60)).await;
+        // No spam by default. When you have real signals, emit AppEvent::Network(...)
+    }
+}
+
+#[embassy_executor::task]
+async fn app_task(
+    ev_rx: Receiver<'static, CriticalSectionRawMutex, AppEvent, 32>,
+    disp_tx: Sender<'static, CriticalSectionRawMutex, DisplayCmd, 4>,
+) {
+    // Refresh policy knobs
+    const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+    const TOUCH_DEBOUNCE: Duration = Duration::from_millis(150);
+    const NET_COALESCE: Duration = Duration::from_millis(500);
+    const BATTERY_DEBOUNCE: Duration = Duration::from_secs(3);
+
+    let mut model = AppModel::default();
+    let mut dirty = true; // draw once at boot
+    let mut pending: Option<PendingRefresh> = Some(PendingRefresh {
+        at: Instant::now(),
+        kind: PendingKind::Immediate,
+    });
+    let mut last_refresh_at = Instant::from_ticks(0);
+
+    loop {
+        // If a refresh is due and we have dirty UI, render now.
+        if let Some(p) = pending {
+            let now = Instant::now();
+            if now >= p.at {
+                if dirty {
+                    // Enforce a minimum interval so we don't hammer e-ink.
+                    let earliest = last_refresh_at + MIN_REFRESH_INTERVAL;
+                    if now < earliest {
+                        pending = Some(PendingRefresh {
+                            at: earliest,
+                            kind: p.kind,
+                        });
+                    } else {
+                        model.counter = model.counter.wrapping_add(1);
+                        disp_tx.send(DisplayCmd::Render(model.clone())).await;
+                        last_refresh_at = Instant::now();
+                        dirty = false;
+                        pending = None;
+                    }
+                    continue;
+                } else {
+                    pending = None;
+                }
+            }
+        }
+
+        // Compute how long we can wait for an event before a scheduled refresh.
+        let next_wait = pending
+            .map(|p| {
+                let now = Instant::now();
+                if p.at <= now {
+                    Duration::from_millis(0)
+                } else {
+                    p.at - now
+                }
+            });
+
+        let ev = if let Some(wait) = next_wait {
+            match with_timeout(wait, ev_rx.receive()).await {
+                Ok(ev) => Some(ev),
+                Err(_) => None, // timeout => we'll loop and trigger refresh if due
+            }
+        } else {
+            Some(ev_rx.receive().await)
+        };
+
+        let Some(ev) = ev else { continue };
+
+        let now = Instant::now();
+		let mut changed = false;
+
+		// Apply event to model + decide refresh scheduling
+		match ev {
+			AppEvent::Key(k) => {
+				if model.last_key != k {
+					model.last_key = k;
+					changed = true;
+
+					pending = Some(PendingRefresh {
+						at: now,
+						kind: PendingKind::Immediate,
+					});
+				}
+			}
+			AppEvent::Touch(t) => {
+				if model.last_touch != t {
+					model.last_touch = t;
+					changed = true;
+
+					let desired = now + TOUCH_DEBOUNCE;
+					pending = match pending {
+						Some(p) if matches!(p.kind, PendingKind::Immediate) => Some(p),
+						Some(p) => Some(PendingRefresh {
+							at: core::cmp::max(p.at, desired),
+							kind: PendingKind::Debounced,
+						}),
+						None => Some(PendingRefresh {
+							at: desired,
+							kind: PendingKind::Debounced,
+						}),
+					};
+				}
+			}
+			AppEvent::Network(n) => {
+				if model.net != n {
+					model.net = n;
+					changed = true;
+
+					let desired = now + NET_COALESCE;
+					pending = match pending {
+						Some(p) if matches!(p.kind, PendingKind::Immediate) => Some(p),
+						Some(p) if matches!(p.kind, PendingKind::Debounced) => Some(PendingRefresh {
+							at: core::cmp::min(p.at, desired),
+							kind: PendingKind::Coalesced,
+						}),
+						Some(p) => Some(PendingRefresh {
+							at: core::cmp::min(p.at, desired),
+							kind: PendingKind::Coalesced,
+						}),
+						None => Some(PendingRefresh {
+							at: desired,
+							kind: PendingKind::Coalesced,
+						}),
+					};
+				}
+			}
+			AppEvent::Battery(b) => {
+				if model.battery != b {
+					model.battery = b;
+					changed = true;
+
+					let desired = now + BATTERY_DEBOUNCE;
+					pending = match pending {
+						Some(p) if matches!(p.kind, PendingKind::Immediate) => Some(p),
+						Some(p) => Some(PendingRefresh {
+							at: core::cmp::min(p.at, desired),
+							kind: p.kind,
+						}),
+						None => Some(PendingRefresh {
+							at: desired,
+							kind: PendingKind::Debounced,
+						}),
+					};
+				}
+			}
+		}
+
+		if changed {
+			dirty = true;
+		}
     }
 }
 
@@ -302,7 +544,7 @@ async fn touch_task(
 async fn epd_task(
     mut display: EInkDisplay<'static>,
     mut spi_dev: RwLockDevice<'static, esp_hal::spi::master::Spi<'static, esp_hal::Async>, Delay>,
-    battery_text: &'static Mutex<CriticalSectionRawMutex, BatteryText>,
+    disp_rx: Receiver<'static, CriticalSectionRawMutex, DisplayCmd, 4>,
 ) {
     info!("EPD: initializing...");
     if let Err(_) = display.init(&mut spi_dev).await {
@@ -313,39 +555,40 @@ async fn epd_task(
     }
     info!("EPD: init OK");
 
-    let mut counter: u32 = 0;
-
     loop {
-        display.clear(BinaryColor::Off).ok();
+        match disp_rx.receive().await {
+            DisplayCmd::Render(model) => {
+                display.clear(BinaryColor::Off).ok();
 
-        // Grab latest battery text without holding the lock while drawing.
-        let batt = {
-            let guard = battery_text.lock().await;
-            guard.clone()
-        };
+                let mut text_buf = heapless::String::<320>::new();
+                let _ = write!(
+                    text_buf,
+                    "T-Deck Pro\n\
+                     Frame: {ctr}\n\n\
+                     Key: {key}\n\
+                     Touch: {touch}\n\
+                     {net}\n\n\
+                     {batt}",
+                    ctr = model.counter,
+                    key = if model.last_key.is_empty() { "(none)" } else { model.last_key.as_str() },
+                    touch =
+                        if model.last_touch.is_empty() { "(none)" } else { model.last_touch.as_str() },
+                    net = if model.net.is_empty() { "" } else { model.net.as_str() },
+                    batt = model.battery,
+                );
 
-        let mut text_buf = heapless::String::<256>::new();
-        let _ = write!(
-            text_buf,
-            "T-Deck Pro\n\
-             Counter: {counter}\n\n\
-             {batt}",
-        );
+                Text::new(
+                    &text_buf,
+                    Point::new(20, 40),
+                    MonoTextStyle::new(&FONT_10X20, BinaryColor::On),
+                )
+                .draw(&mut display)
+                .ok();
 
-        Text::new(
-            &text_buf,
-            Point::new(20, 40),
-            MonoTextStyle::new(&FONT_10X20, BinaryColor::On),
-        )
-        .draw(&mut display)
-        .ok();
-
-        if let Err(_) = display.refresh_display(&mut spi_dev).await {
-            warn!("EPD: refresh failed");
+                if let Err(_) = display.refresh_display(&mut spi_dev).await {
+                    warn!("EPD: refresh failed");
+                }
+            }
         }
-
-        counter = counter.wrapping_add(1);
-        Timer::after(Duration::from_secs(5)).await;
     }
 }
-
