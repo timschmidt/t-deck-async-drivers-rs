@@ -1,3 +1,7 @@
+# Building
+
+source ~/export-esp.sh
+
 # T-Deck Async Rust Drivers
 
 This repository contains a collection of asynchronous Rust drivers for the LilyGo T-Deck device, built on the Embassy framework. Each driver is in its own crate within the workspace.
