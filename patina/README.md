@@ -1,0 +1,59 @@
+## Todo
+- comprehensive model of firmware state
+- update GUI regions independently, batch changes?
+- App / launcher behavior with respect to inputs and drawing
+- UI toolkit
+	- Textarea control
+	  - scrollable, number of lines, width, starting line
+	  - editable?
+	- Dropdown control
+	  - enum based?
+	- Text input control
+	  - animate cursor blink?
+	- Password input control
+	- IPv4 addr control
+	- IPv6 addr control
+	- Progress bar control
+	- Tree list control
+	- File tree control
+	- File picker
+	- Button
+	- Tilearea (map) control
+	- 2D Plot control
+	- 3D Plot control
+	- 
+- Wifi status and config app
+- bt status and config app
+- screen settings app
+  - refresh rate, rotation, 
+- time / date and timezone app
+- i2c scanner app
+- spi scanner app
+- battery stats app
+- cpu app
+  - cores, mhz, caches, psram, stack, heap
+- gps map app
+- terminal app
+- data logging app
+- mp3 player app
+- audio note recorder app
+- IR blaster app
+- USB OTG storage driver
+- SD storage driver
+- partition / format for both
+- volume up/down app
+- power off app
+- IMU app
+- PMU app
+- calculator app - GUI, terminal, 2d, 3d plots
+- Contacts
+- Phone
+- Text editor
+- File manager
+- 2fa / ubikey style app
+- decompressor / compressor app
+- image viewer
+- camera app
+- scheduled system events app
+- calendar app
+- 
